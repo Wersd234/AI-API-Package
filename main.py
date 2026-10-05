@@ -71,7 +71,11 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="AI-RP-Proxy", version="0.3.0", lifespan=lifespan)
 
 
+# Alias routes without the /v1 prefix: OpenAI clients disagree on whether
+# the base URL should include it (SillyTavern appends /models to whatever
+# base URL is configured, so forgetting the suffix must not 404).
 @app.get("/v1/models")
+@app.get("/models")
 async def list_models():
     """ST probes this endpoint when testing the connection."""
     return ModelListResponse(
@@ -85,6 +89,7 @@ async def list_models():
 
 
 @app.post("/v1/chat/completions")
+@app.post("/chat/completions")
 async def chat_completions(request: ChatCompletionRequest, raw_request: Request):
     # --- Streaming path (ST's default) ---
     if request.stream:
