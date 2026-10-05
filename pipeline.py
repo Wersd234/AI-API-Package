@@ -584,7 +584,12 @@ async def _stream_stage2_impl(
             "total_s": s2_total,
             "ttft_s": (s2_first - s2_start) if s2_first else None,
             "gen_s": (time.monotonic() - s2_first) if s2_first else None,
-            "completion_tokens": (s2_usage or {}).get("completion_tokens") or (s2_n or None),
+            # Prefer the STREAMED chunk count over the usage chunk: some
+            # servers count hidden reasoning tokens in completion_tokens
+            # without streaming them, which made the reported tok/s wildly
+            # diverge from the visible output speed.
+            "completion_tokens": s2_n or (s2_usage or {}).get("completion_tokens"),
+            "usage_completion_tokens": (s2_usage or {}).get("completion_tokens"),
             "partial": disconnected,
         }
 
@@ -676,8 +681,25 @@ def log_request_summary(stats: dict) -> None:
     if s2:
         partial = " (partial)" if s2.get("partial") else ""
         logger.info("Stage 2 (style):   %s%s", _fmt_stage(s2), partial)
-    total = sum(s.get("total_s", 0.0) for s in (s1, s2) if s)
-    logger.info("Total: %.1fs", total)
+    # Wall-clock total: with the tail split the stages OVERLAP, so summing
+    # stage durations would double-count the overlap. stats["request_start"]
+    # is recorded by the wrapper when the request begins.
+    request_start = stats.get("request_start")
+    if request_start:
+        logger.info("Total (wall): %.1fs", time.monotonic() - request_start)
+    else:
+        total = sum(s.get("total_s", 0.0) for s in (s1, s2) if s)
+        logger.info("Total: %.1fs", total)
+    # Surface hidden-thinking reports so they can be diagnosed instead of
+    # silently skewing expectations (visible tokens vs usage tokens).
+    if s2 and s2.get("usage_completion_tokens") and s2.get("completion_tokens"):
+        hidden = s2["usage_completion_tokens"] - s2["completion_tokens"]
+        if hidden > 50:
+            logger.info(
+                "Note: stage 2 usage reports %d completion tokens but only %d were visible "
+                "(~%d hidden reasoning tokens)",
+                s2["usage_completion_tokens"], s2["completion_tokens"], hidden,
+            )
 
 
 async def _stream_text_chunks(text: str, chat_id: str, slice_chars: int = 40) -> AsyncGenerator[str, None]:
