@@ -31,11 +31,18 @@ services:
       STAGE2_MODEL: ${STAGE2_MODEL:-gemma-4-26b}
       STAGE2_MAX_TOKENS: ${STAGE2_MAX_TOKENS:-1536}
       STAGE2_TIMEOUT: ${STAGE2_TIMEOUT:-180}
-      STAGE2_PROMPT_FILE: ${STAGE2_PROMPT_FILE:-stage2_prompt.txt}
+      # Points at the bind-mounted copy by default so prompt edits on the
+      # host go live without rebuild; falls back to the baked-in copy if the
+      # mount is absent (loader handles that gracefully).
+      STAGE2_PROMPT_FILE: ${STAGE2_PROMPT_FILE:-/app/prompt/stage2_prompt.txt}
       STAGE2_STYLE_TAGS: ${STAGE2_STYLE_TAGS:-}
       # --- SSE keepalive interval during stage 1 (seconds) ---
       KEEPALIVE_INTERVAL: ${KEEPALIVE_INTERVAL:-5}
     volumes:
-      # The proxy re-reads this file on every request, so mounting it makes
-      # prompt edits take effect immediately — no rebuild, no restart.
-      - ./stage2_prompt.txt:/app/stage2_prompt.txt:ro
+      # Mount the project DIRECTORY, not the single file. Bind-mounting a
+      # file has a notorious failure mode: if the host path is missing when
+      # the container is created, Docker auto-creates it as an empty
+      # directory, and every later start dies with "mount a directory onto
+      # a file". A directory mount never hits that path, and the proxy still
+      # re-reads the prompt on every request so host edits go live.
+      - ./:/app/prompt:ro

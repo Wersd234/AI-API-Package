@@ -116,13 +116,25 @@ def load_stage2_prompt() -> str:
     """
     if not settings.stage2_prompt_file:
         return ""
-    path = Path(settings.stage2_prompt_file)
-    if not path.is_absolute():
-        path = Path(__file__).resolve().parent / path
+    configured = Path(settings.stage2_prompt_file)
+    local_default = Path(__file__).resolve().parent / "stage2_prompt.txt"
+    path = configured if configured.is_absolute() else local_default.parent / configured
     try:
         return path.read_text(encoding="utf-8").strip()
-    except FileNotFoundError:
-        logger.warning("Stage 2 prompt file not found: %s (running without system prompt)", path)
+    except OSError as exc:
+        # OSError covers FileNotFoundError plus the nastier cases seen in the
+        # wild (e.g. a stray DIRECTORY at the mount path from Docker's
+        # auto-create behaviour, permission errors). If a non-default path
+        # fails, fall back to the copy baked into the project directory so a
+        # bad mount never silently kills the polishing stage.
+        logger.warning("Stage 2 prompt unreadable at %s (%s)", path, exc)
+        if path != local_default:
+            try:
+                logger.info("Stage 2 prompt: falling back to baked-in %s", local_default)
+                return local_default.read_text(encoding="utf-8").strip()
+            except OSError:
+                pass
+        logger.warning("Stage 2 running WITHOUT a system prompt")
         return ""
 
 # Fields never copied from the ST request into the stage-2 payload:
