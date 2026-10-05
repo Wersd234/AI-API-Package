@@ -39,6 +39,16 @@ class Settings(BaseSettings):
     # to recognise them. Disable if your stage-1 server already separates
     # reasoning via --reasoning-format.
     stage1_strip_reasoning: bool = True
+    # Split stage-1 output at the first functional-block marker: the story
+    # body is handed to stage 2 IMMEDIATELY (overlapping the tail's
+    # generation), and the tail (UpdateVariable / scene / details /
+    # StatusPlaceHolderImpl) is appended to the reply UNPOLISHED. Two wins:
+    # much earlier first visible token, and MVU blocks can never be mangled
+    # by the style model. If no marker is found, the whole output is
+    # polished as before (graceful fallback for non-MVU cards).
+    stage1_tail_split: bool = True
+    # Comma-separated marker strings; the earliest match marks the tail start.
+    stage1_tail_markers: str = "<UpdateVariable>"
     # A large thinking MoE on a long context can legitimately need tens of
     # minutes: at ~2.6 tk/s, 2048 thinking tokens + 1024 story tokens is
     # already ~20 min. This timeout is a hang-detector, not a deadline.

@@ -6,6 +6,7 @@ verbatim; stage 2 receives stage-1 output as a single user message; the
 streamed polish is forwarded chunk-by-chunk to ST.
 """
 
+import asyncio
 import logging
 import time
 import uuid
@@ -102,11 +103,24 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
     # Stage 1 runs here in the endpoint, so its failures surface as a clean
     # HTTP 502 instead of a broken stream.
     stats: dict = {}
-    raw_text = await run_stage1(request, stats)
+    split: dict | None = {"body_ready": asyncio.Event()} if settings.stage1_tail_split else None
+    raw_text = await run_stage1(request, stats, split)
     if not raw_text or not raw_text.strip():
         raise HTTPException(502, "Stage 1 returned empty response")
 
-    payload = build_stage2_payload(request, raw_text, stream=False)
+    # When the tail split fired, stage 2 polishes only the story body and the
+    # functional tail is appended verbatim; otherwise polish everything.
+    if split is not None and split.get("marker_found"):
+        body_text = split["body"]
+        tail_text = split.get("tail", "")
+        logger.info(
+            "Stage 1: tail split — %d body chars to polish, %d tail chars appended raw",
+            len(body_text), len(tail_text),
+        )
+    else:
+        body_text, tail_text = raw_text, ""
+
+    payload = build_stage2_payload(request, body_text, stream=False)
     usage_out: dict = {}
     s2_start = time.monotonic()
     polished = await call_nonstreaming(
@@ -119,7 +133,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
     }
     # If the polish pass comes back empty for any reason, the raw draft is
     # strictly better than returning nothing.
-    final = polished if polished and polished.strip() else raw_text
+    final = (polished if polished and polished.strip() else body_text) + tail_text
     log_request_summary(stats)
 
     return ChatCompletionResponse(

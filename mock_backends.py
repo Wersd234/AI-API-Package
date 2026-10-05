@@ -53,10 +53,11 @@ MESSY_DRAFT = (
     + FUNCTIONAL_TAIL
 )
 
+# NOTE: stage 2 in production never sees the functional tail (the proxy
+# splits it off), so the mock's polished output must NOT include it either.
 POLISHED = (
     "*She eases the heavy door open, hinges sighing.* "
     "\u201cWe need to talk,\u201d she says \u2014 voice low."
-    + FUNCTIONAL_TAIL
 )
 
 

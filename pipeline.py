@@ -106,6 +106,21 @@ def extract_style_blocks(request: ChatCompletionRequest) -> str:
     return "\n".join(found)
 
 
+def _tail_markers() -> list:
+    """Configured functional-block markers that mark the start of the unpolished tail."""
+    return [m.strip() for m in settings.stage1_tail_markers.split(",") if m.strip()]
+
+
+def _find_tail_start(text: str) -> Optional[int]:
+    """Index of the earliest configured tail marker in the text, or None."""
+    best: Optional[int] = None
+    for marker in _tail_markers():
+        i = text.find(marker)
+        if i >= 0 and (best is None or i < best):
+            best = i
+    return best
+
+
 def load_stage2_prompt() -> str:
     """
     Read the stage-2 system prompt from its text file on every request.
@@ -217,7 +232,11 @@ def build_stage1_payload(request: ChatCompletionRequest) -> Dict[str, Any]:
     return payload
 
 
-async def run_stage1(request: ChatCompletionRequest, stats: Optional[dict] = None) -> Optional[str]:
+async def run_stage1(
+    request: ChatCompletionRequest,
+    stats: Optional[dict] = None,
+    split: Optional[dict] = None,
+) -> Optional[str]:
     """
     Forward ST's request to the content model.
 
@@ -238,6 +257,9 @@ async def run_stage1(request: ChatCompletionRequest, stats: Optional[dict] = Non
     logger.info("Stage 1: %d messages -> %s", len(payload["messages"]), url)
 
     content_parts: list = []
+    # Growing story text, maintained only when the tail split is enabled so
+    # the marker scan does not cost anything on non-split requests.
+    story_text = ""
     reasoning_n = 0
     story_n = 0
     usage: Optional[Dict[str, Any]] = None
@@ -281,6 +303,26 @@ async def run_stage1(request: ChatCompletionRequest, stats: Optional[dict] = Non
                     if piece:
                         story_n += 1
                         content_parts.append(piece)
+                        if split is not None:
+                            # Accumulate for the WHOLE stream, not just until
+                            # the marker fires: the tail slice is taken from
+                            # this text after the stream completes, so it must
+                            # keep growing past the detection point.
+                            story_text += piece
+                            if not split.get("marker_found"):
+                                idx = _find_tail_start(story_text)
+                                if idx is not None:
+                                    body = story_text[:idx]
+                                    if settings.stage1_strip_reasoning:
+                                        body = strip_reasoning(body)
+                                    split["marker_found"] = True
+                                    split["body"] = body
+                                    split["tail_start"] = idx
+                                    split["body_ready"].set()
+                                    logger.info(
+                                        "Stage 1: tail marker at char %d, body split off for early stage 2",
+                                        idx,
+                                    )
 
                     # One chunk ~= one token for llama-server; llama.cpp-style log.
                     total_n = reasoning_n + story_n
@@ -321,6 +363,10 @@ async def run_stage1(request: ChatCompletionRequest, stats: Optional[dict] = Non
         if removed > 0:
             logger.info("Stage 1: stripped %d chars of leaked reasoning", removed)
         text = stripped
+    if split is not None and split.get("marker_found"):
+        # The tail is NOT reasoning-stripped: it holds functional blocks that
+        # must survive byte-identical, and reasoning tags do not occur there.
+        split["tail"] = story_text[split["tail_start"]:]
     return text
 
 
@@ -387,21 +433,47 @@ async def _stream_stage2_impl(
     # intermediate proxy from timing out the idle connection, and checking
     # is_disconnected lets us cancel the upstream GPU work when the user
     # aborts the generation in ST.
-    stage1_task = asyncio.create_task(run_stage1(request, stats))
+    # Tail split: when enabled, stage 1 watches its own output for the
+    # first functional-block marker. The story body is sent to stage 2
+    # IMMEDIATELY while the tail is still generating; stage1_task is then
+    # left running and its tail is appended unpolished after stage 2 ends.
+    split: Optional[dict] = None
+    wait_task: Optional[asyncio.Task] = None
+    if settings.stage1_tail_split:
+        split = {"body_ready": asyncio.Event()}
+        wait_task = asyncio.create_task(split["body_ready"].wait())
+
+    stage1_task = asyncio.create_task(run_stage1(request, stats, split))
     try:
         while True:
             if await raw_request.is_disconnected():
                 logger.info("Client disconnected during stage 1, cancelling upstream call")
                 stage1_task.cancel()
                 return
-            try:
-                raw_text = await asyncio.wait_for(
-                    asyncio.shield(stage1_task),
-                    timeout=settings.keepalive_interval,
+            done, _pending = await asyncio.wait(
+                [t for t in (stage1_task, wait_task) if t is not None],
+                timeout=settings.keepalive_interval,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                yield ": waiting for stage 1\n\n"
+                continue
+            if wait_task is not None and wait_task in done and split.get("marker_found"):
+                # Body ready while the tail is still generating — leave
+                # stage1_task RUNNING and start stage 2 right now.
+                raw_text = split["body"]
+                logger.info(
+                    "Stage 1: body ready early (%d chars), stage 2 starts while tail generates",
+                    len(raw_text),
                 )
                 break
-            except asyncio.TimeoutError:
-                yield ": waiting for stage 1\n\n"
+            if stage1_task in done:
+                full_text = stage1_task.result()  # raises on backend failure
+                if split is not None and split.get("marker_found"):
+                    raw_text = split["body"]
+                else:
+                    raw_text = full_text
+                break
     except HTTPException as exc:
         yield _sse_error(str(exc.detail))
         return
@@ -410,14 +482,17 @@ async def _stream_stage2_impl(
         yield _sse_error(f"Stage 1 failed: {exc}")
         return
     finally:
-        # If the generator itself gets cancelled (client went away mid-wait),
-        # make sure the upstream stage-1 request does not keep burning GPU.
-        if not stage1_task.done():
-            stage1_task.cancel()
+        if wait_task is not None and not wait_task.done():
+            wait_task.cancel()
+        # NOTE: stage1_task is deliberately NOT cancelled here — on a
+        # successful body split it is still generating the tail, which is
+        # awaited before the tail-append below. Disconnect paths cancel it.
 
     if not raw_text or not raw_text.strip():
         yield _sse_error("Stage 1 returned empty response")
         return
+
+    tail_pending = split is not None and split.get("marker_found")
 
     payload = build_stage2_payload(request, raw_text, stream=True)
     url = f"{settings.stage2_url}/chat/completions"
@@ -447,6 +522,8 @@ async def _stream_stage2_impl(
                     if await raw_request.is_disconnected():
                         logger.info("Client disconnected, stopping stage 2 stream")
                         disconnected = True
+                        if not stage1_task.done():
+                            stage1_task.cancel()
                         break
                     if not line:
                         continue
@@ -464,6 +541,12 @@ async def _stream_stage2_impl(
                         # ST never requested it, so it is consumed here and
                         # never forwarded downstream.
                         if not choices:
+                            continue
+
+                        # Defer stage 2's own finish marker while a tail
+                        # still has to be appended: the reply is not complete
+                        # until the tail has been streamed.
+                        if tail_pending and choices[0].get("finish_reason"):
                             continue
 
                         # One chunk ~= one token; llama.cpp-style progress.
@@ -486,6 +569,8 @@ async def _stream_stage2_impl(
                         # of bloated \uXXXX escape sequences.
                         yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
                     else:
+                        if line == "data: [DONE]" and tail_pending:
+                            continue  # terminator deferred until after the tail
                         # Covers "data: [DONE]" and any ":" comment lines.
                         yield line + "\n\n"
     except httpx.HTTPError as exc:
@@ -502,6 +587,38 @@ async def _stream_stage2_impl(
             "completion_tokens": (s2_usage or {}).get("completion_tokens") or (s2_n or None),
             "partial": disconnected,
         }
+
+    # --- Append the functional tail, unpolished ---
+    # Stage 2 is done; the tail was generating in parallel and may still be
+    # running. Wait for it (with keepalives), then stream it verbatim: MVU
+    # blocks never pass through the style model, so they cannot be mangled.
+    if tail_pending:
+        if not stage1_task.done():
+            logger.info("Stage 2 finished; waiting for stage 1 tail to complete")
+            while not stage1_task.done():
+                if await raw_request.is_disconnected():
+                    logger.info("Client disconnected during tail wait, cancelling stage 1")
+                    stage1_task.cancel()
+                    return
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(stage1_task),
+                        timeout=settings.keepalive_interval,
+                    )
+                except asyncio.TimeoutError:
+                    yield ": waiting for stage 1 tail\n\n"
+        try:
+            stage1_task.result()  # surface late stage-1 failures without crashing
+        except Exception as exc:
+            logger.warning("Stage 1 failed during tail generation: %s", exc)
+        tail = (split or {}).get("tail", "")
+        if tail:
+            logger.info("Stage 1: appending functional tail (%d chars) unpolished", len(tail))
+            async for event in _stream_text_chunks(tail, chat_id):
+                yield event
+        else:
+            # Stage 2's terminator was suppressed; still owe ST a clean end.
+            yield "data: [DONE]\n\n"
 
 
 async def stream_stage2(
@@ -561,6 +678,33 @@ def log_request_summary(stats: dict) -> None:
         logger.info("Stage 2 (style):   %s%s", _fmt_stage(s2), partial)
     total = sum(s.get("total_s", 0.0) for s in (s1, s2) if s)
     logger.info("Total: %.1fs", total)
+
+
+async def _stream_text_chunks(text: str, chat_id: str, slice_chars: int = 40) -> AsyncGenerator[str, None]:
+    """
+    Synthesize an OpenAI-style SSE stream from a finished string. Used to
+    append the functional tail after the polished body: ST receives it as
+    ordinary streamed content, followed by a proper finish chunk and [DONE].
+    """
+    for i in range(0, len(text), slice_chars):
+        chunk = {
+            "id": chat_id,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": settings.virtual_model_name,
+            "choices": [{"index": 0, "delta": {"content": text[i:i + slice_chars]}, "finish_reason": None}],
+        }
+        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+        await asyncio.sleep(0)  # stay responsive without throttling
+    final = {
+        "id": chat_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": settings.virtual_model_name,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+    }
+    yield f"data: {json.dumps(final, ensure_ascii=False)}\n\n"
+    yield "data: [DONE]\n\n"
 
 
 def _sse_error(message: str) -> str:
