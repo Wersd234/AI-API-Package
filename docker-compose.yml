@@ -1,0 +1,17 @@
+# Convenience wrapper — plain `docker run` works just as well:
+#   docker build -t ai-rp-proxy .
+#   docker run -d --name ai-rp-proxy --env-file .env -p 5000:5000 ai-rp-proxy
+
+services:
+  ai-rp-proxy:
+    build: .
+    container_name: ai-rp-proxy
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    env_file:
+      - .env
+    volumes:
+      # The proxy re-reads this file on every request, so mounting it makes
+      # prompt edits take effect immediately — no rebuild, no restart.
+      - ./stage2_prompt.txt:/app/stage2_prompt.txt:ro

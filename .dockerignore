@@ -1,0 +1,8 @@
+.git
+.env
+__pycache__
+venv
+*.pyc
+mock_backends.py
+README.md
+docker-compose.yml

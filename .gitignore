@@ -1,0 +1,7 @@
+# Local config may contain LAN topology / paths — never commit it.
+.env
+
+__pycache__/
+*.pyc
+venv/
+.vscode/
