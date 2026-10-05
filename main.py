@@ -107,7 +107,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
     # --- Non-streaming fallback (useful for curl tests and simple clients) ---
     # Stage 1 runs here in the endpoint, so its failures surface as a clean
     # HTTP 502 instead of a broken stream.
-    stats: dict = {}
+    stats: dict = {"request_start": time.monotonic()}
     split: dict | None = {"body_ready": asyncio.Event()} if settings.stage1_tail_split else None
     raw_text = await run_stage1(request, stats, split)
     if not raw_text or not raw_text.strip():
