@@ -1,6 +1,11 @@
-# Convenience wrapper — plain `docker run` works just as well:
-#   docker build -t ai-rp-proxy .
-#   docker run -d --name ai-rp-proxy --env-file .env -p 5000:5000 ai-rp-proxy
+# AI-RP-Proxy — works with Portainer stacks, plain compose, or plain docker.
+#
+# No `env_file:` directive: requiring a .env file breaks Portainer git stacks
+# (the .env is deliberately not committed). Every setting is passed through
+# with a sane default instead, so all three config styles work:
+#   1. Portainer: paste variables into the stack's "Environment variables" UI
+#   2. CLI compose: create .env from .env.example (compose reads it automatically)
+#   3. Nothing at all: starts on defaults (localhost backends), edit later
 
 services:
   ai-rp-proxy:
@@ -8,9 +13,28 @@ services:
     container_name: ai-rp-proxy
     restart: unless-stopped
     ports:
-      - "5000:5000"
-    env_file:
-      - .env
+      # Container always serves on 0.0.0.0:5000 internally; PROXY_PORT only
+      # changes the published host port.
+      - "${PROXY_PORT:-5000}:5000"
+    environment:
+      VIRTUAL_MODEL_NAME: ${VIRTUAL_MODEL_NAME:-rp-two-stage}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # --- Stage 1: content model ---
+      STAGE1_URL: ${STAGE1_URL:-http://localhost:8080/v1}
+      STAGE1_MODEL: ${STAGE1_MODEL:-qwen-3.8-flash}
+      STAGE1_MAX_TOKENS: ${STAGE1_MAX_TOKENS:-1024}
+      STAGE1_THINKING_HEADROOM: ${STAGE1_THINKING_HEADROOM:-2048}
+      STAGE1_TIMEOUT: ${STAGE1_TIMEOUT:-7200}
+      STAGE1_STRIP_REASONING: ${STAGE1_STRIP_REASONING:-true}
+      # --- Stage 2: style model ---
+      STAGE2_URL: ${STAGE2_URL:-http://localhost:8081/v1}
+      STAGE2_MODEL: ${STAGE2_MODEL:-gemma-4-26b}
+      STAGE2_MAX_TOKENS: ${STAGE2_MAX_TOKENS:-1536}
+      STAGE2_TIMEOUT: ${STAGE2_TIMEOUT:-180}
+      STAGE2_PROMPT_FILE: ${STAGE2_PROMPT_FILE:-stage2_prompt.txt}
+      STAGE2_STYLE_TAGS: ${STAGE2_STYLE_TAGS:-}
+      # --- SSE keepalive interval during stage 1 (seconds) ---
+      KEEPALIVE_INTERVAL: ${KEEPALIVE_INTERVAL:-5}
     volumes:
       # The proxy re-reads this file on every request, so mounting it makes
       # prompt edits take effect immediately — no rebuild, no restart.
