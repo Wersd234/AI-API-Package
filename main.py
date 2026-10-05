@@ -19,7 +19,7 @@ from config import settings
 from pipeline import (
     build_stage2_payload,
     call_nonstreaming,
-    looks_like_refusal,
+    log_request_summary,
     run_stage1,
     stream_stage2,
 )
@@ -101,24 +101,26 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
     # --- Non-streaming fallback (useful for curl tests and simple clients) ---
     # Stage 1 runs here in the endpoint, so its failures surface as a clean
     # HTTP 502 instead of a broken stream.
-    raw_text = await run_stage1(request)
+    stats: dict = {}
+    raw_text = await run_stage1(request, stats)
     if not raw_text or not raw_text.strip():
         raise HTTPException(502, "Stage 1 returned empty response")
 
     payload = build_stage2_payload(request, raw_text, stream=False)
-    polished = await call_nonstreaming(settings.stage2_url, payload, settings.stage2_timeout)
-    # Empty or refusal-looking polish output is discarded: serving the raw
-    # stage-1 draft is strictly better than serving nothing or a refusal.
-    # Only the opening is scanned for refusal markers (same rationale as the
-    # streaming path: markers can legitimately appear mid-story).
-    if polished and polished.strip() and not looks_like_refusal(
-        polished[: settings.refusal_check_chars]
-    ):
-        final = polished
-    else:
-        if polished and polished.strip():
-            logger.warning("Stage 2 refused; serving raw stage-1 text")
-        final = raw_text
+    usage_out: dict = {}
+    s2_start = time.monotonic()
+    polished = await call_nonstreaming(
+        settings.stage2_url, payload, settings.stage2_timeout, usage_out
+    )
+    stats["stage2"] = {
+        "total_s": time.monotonic() - s2_start,
+        "prompt_tokens": usage_out.get("prompt_tokens"),
+        "completion_tokens": usage_out.get("completion_tokens"),
+    }
+    # If the polish pass comes back empty for any reason, the raw draft is
+    # strictly better than returning nothing.
+    final = polished if polished and polished.strip() else raw_text
+    log_request_summary(stats)
 
     return ChatCompletionResponse(
         id=f"chatcmpl-{uuid.uuid4().hex[:12]}",

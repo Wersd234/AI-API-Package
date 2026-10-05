@@ -59,8 +59,6 @@ POLISHED = (
     + FUNCTIONAL_TAIL
 )
 
-# What this mock actually emits as stage 2 (refusal mode switch).
-OUT_TEXT = REFUSAL_TEXT if STAGE2_REFUSE else POLISHED
 
 stage1 = FastAPI()
 stage2 = FastAPI()
@@ -149,14 +147,19 @@ async def stage2_chat(body: dict = Body(...)):
             "choices": [
                 {
                     "index": 0,
-                    "message": {"role": "assistant", "content": OUT_TEXT},
+                    "message": {"role": "assistant", "content": POLISHED},
                     "finish_reason": "stop",
                 }
-            ]
+            ],
+            "usage": {
+                "prompt_tokens": 321,
+                "completion_tokens": len(POLISHED.split()),
+                "total_tokens": 321 + len(POLISHED.split()),
+            },
         }
 
     async def gen():
-        for tok in OUT_TEXT.split(" "):
+        for tok in POLISHED.split(" "):
             chunk = {
                 "id": "mock-chunk",
                 "object": "chat.completion.chunk",
@@ -174,6 +177,19 @@ async def stage2_chat(body: dict = Body(...)):
             "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
         }
         yield f"data: {json.dumps(final)}\n\n"
+        usage = {
+            "id": "mock-chunk",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "mock-gemma",
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 321,
+                "completion_tokens": len(POLISHED.split()),
+                "total_tokens": 321 + len(POLISHED.split()),
+            },
+        }
+        yield f"data: {json.dumps(usage)}\n\n"
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream")

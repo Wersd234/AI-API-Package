@@ -106,58 +106,6 @@ def extract_style_blocks(request: ChatCompletionRequest) -> str:
     return "\n".join(found)
 
 
-def load_refusal_markers() -> list:
-    """Load refusal markers from the data file (re-read per request, same
-    rationale as the prompt file: cheap, and editable without restart)."""
-    if not settings.stage2_refusal_fallback:
-        return []
-    path = Path(settings.refusal_markers_file)
-    if not path.is_absolute():
-        path = Path(__file__).resolve().parent / path
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except FileNotFoundError:
-        return []
-    return [l.strip().lower() for l in lines if l.strip() and not l.startswith("#")]
-
-
-def looks_like_refusal(text: str) -> bool:
-    """
-    Refusal detection for the stage-2 fallback. Callers must pass only the
-    OPENING of the output: refusals start at the first token, while marker
-    phrases can legitimately appear mid-story in character dialogue.
-    """
-    low = text.lower()
-    return any(m in low for m in load_refusal_markers())
-
-
-async def _stream_raw_as_chunks(text: str, chat_id: str, slice_chars: int = 20) -> AsyncGenerator[str, None]:
-    """
-    Synthesize an OpenAI-style SSE stream from a finished string. Used when
-    stage 2's output must be discarded (refusal fallback): ST still receives
-    a normal streamed reply — the unpolished stage-1 draft.
-    """
-    for i in range(0, len(text), slice_chars):
-        chunk = {
-            "id": chat_id,
-            "object": "chat.completion.chunk",
-            "created": int(time.time()),
-            "model": settings.virtual_model_name,
-            "choices": [{"index": 0, "delta": {"content": text[i:i + slice_chars]}, "finish_reason": None}],
-        }
-        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-        await asyncio.sleep(0)  # stay responsive without throttling
-    final = {
-        "id": chat_id,
-        "object": "chat.completion.chunk",
-        "created": int(time.time()),
-        "model": settings.virtual_model_name,
-        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-    }
-    yield f"data: {json.dumps(final, ensure_ascii=False)}\n\n"
-    yield "data: [DONE]\n\n"
-
-
 def load_stage2_prompt() -> str:
     """
     Read the stage-2 system prompt from its text file on every request.
@@ -200,7 +148,12 @@ def _base_params(request: ChatCompletionRequest) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Low-level non-streaming call with the backend's own error body surfaced
 # ---------------------------------------------------------------------------
-async def call_nonstreaming(base_url: str, payload: Dict[str, Any], timeout: int) -> Optional[str]:
+async def call_nonstreaming(
+    base_url: str,
+    payload: Dict[str, Any],
+    timeout: int,
+    usage_out: Optional[dict] = None,
+) -> Optional[str]:
     """
     POST a non-streaming chat completion.
 
@@ -221,7 +174,11 @@ async def call_nonstreaming(base_url: str, payload: Dict[str, Any], timeout: int
         logger.error("Backend %s HTTP %d: %s", base_url, resp.status_code, detail)
         raise HTTPException(502, f"Backend HTTP {resp.status_code}: {detail}")
 
-    choices = resp.json().get("choices", [])
+    data = resp.json()
+    # Let the caller harvest token-usage stats for the timing summary.
+    if usage_out is not None:
+        usage_out.update(data.get("usage") or {})
+    choices = data.get("choices", [])
     return choices[0].get("message", {}).get("content", "") if choices else None
 
 
@@ -248,7 +205,7 @@ def build_stage1_payload(request: ChatCompletionRequest) -> Dict[str, Any]:
     return payload
 
 
-async def run_stage1(request: ChatCompletionRequest) -> Optional[str]:
+async def run_stage1(request: ChatCompletionRequest, stats: Optional[dict] = None) -> Optional[str]:
     """
     Forward ST's request to the content model.
 
@@ -327,16 +284,24 @@ async def run_stage1(request: ChatCompletionRequest) -> Optional[str]:
     total_s = time.monotonic() - start
     text = "".join(content_parts)
 
-    if usage:
-        logger.info(
-            "Stage 1 done: prompt=%s tokens, completion=%s tokens, total=%.1fs",
-            usage.get("prompt_tokens"), usage.get("completion_tokens"), total_s,
-        )
-    else:
-        logger.info(
-            "Stage 1 done: ~%d tokens (reasoning=%d, story=%d) in %.1fs",
-            reasoning_n + story_n, reasoning_n, story_n, total_s,
-        )
+    # Record per-stage timing for the end-of-request summary. Token counts
+    # come from the usage chunk when the server provides one, otherwise from
+    # chunk counting (one chunk ~= one token on llama-server).
+    ttft_s = (first_token_at - start) if first_token_at else None
+    if stats is not None:
+        stats["stage1"] = {
+            "total_s": total_s,
+            "ttft_s": ttft_s,
+            "gen_s": (total_s - ttft_s) if ttft_s else None,
+            "prompt_tokens": (usage or {}).get("prompt_tokens"),
+            "completion_tokens": (usage or {}).get("completion_tokens") or (reasoning_n + story_n) or None,
+            "reasoning_n": reasoning_n,
+            "story_n": story_n,
+        }
+    logger.info(
+        "Stage 1 done: completion=%s tokens (reasoning=%d, story=%d), total=%.1fs",
+        (usage or {}).get("completion_tokens", "?"), reasoning_n, story_n, total_s,
+    )
 
     if text and settings.stage1_strip_reasoning:
         stripped = strip_reasoning(text)
@@ -371,6 +336,10 @@ def build_stage2_payload(request: ChatCompletionRequest, raw_text: str, stream: 
     messages.append({"role": "user", "content": raw_text})
     payload["messages"] = messages
     payload["stream"] = stream
+    if stream:
+        # Exact completion-token counts for the timing summary; servers that
+        # do not support stream_options simply ignore it.
+        payload["stream_options"] = {"include_usage": True}
 
     # The polish pass may expand the text; its budget must be at least what
     # stage 1 was allowed to produce, otherwise output gets truncated.
@@ -385,9 +354,10 @@ def build_stage2_payload(request: ChatCompletionRequest, raw_text: str, stream: 
     return payload
 
 
-async def stream_stage2(
+async def _stream_stage2_impl(
     request: ChatCompletionRequest,
     raw_request: Request,
+    stats: dict,
 ) -> AsyncGenerator[str, None]:
     """
     Run stage 1, then stream stage 2's SSE output to ST.
@@ -405,7 +375,7 @@ async def stream_stage2(
     # intermediate proxy from timing out the idle connection, and checking
     # is_disconnected lets us cancel the upstream GPU work when the user
     # aborts the generation in ST.
-    stage1_task = asyncio.create_task(run_stage1(request))
+    stage1_task = asyncio.create_task(run_stage1(request, stats))
     try:
         while True:
             if await raw_request.is_disconnected():
@@ -445,17 +415,8 @@ async def stream_stage2(
     s2_start = time.monotonic()
     s2_first: Optional[float] = None
     s2_n = 0
+    s2_usage: Optional[dict] = None
     disconnected = False
-
-    # Refusal-fallback buffering: hold back the OPENING of stage 2's output
-    # until there is enough text to judge whether the style model refused the
-    # content (safety-tuned models do this with NSFW). Clean output is then
-    # flushed downstream; a refusal is discarded and the raw stage-1 draft is
-    # streamed instead, so the story never breaks.
-    buffered: list = []
-    buffer_text = ""
-    decided = False
-    upstream_done = False
 
     try:
         async with httpx.AsyncClient(
@@ -480,82 +441,114 @@ async def stream_stage2(
                     if line.startswith("data: ") and line != "data: [DONE]":
                         try:
                             chunk = json.loads(line[6:])
-                            # One chunk ~= one token; llama.cpp-style progress.
-                            choices = chunk.get("choices") or []
-                            piece = ""
-                            if choices:
-                                piece = (choices[0].get("delta") or {}).get("content") or ""
-                                if piece:
-                                    if s2_first is None:
-                                        s2_first = time.monotonic()
-                                        logger.info("Stage 2: TTFT %.2fs", s2_first - s2_start)
-                                    s2_n += 1
-                                    if s2_n % 100 == 0:
-                                        tg = s2_n / max(time.monotonic() - s2_first, 1e-6)
-                                        logger.info("Stage 2: n_gen=%d, tg=%.1f t/s", s2_n, tg)
-                            # Consistent id/model so ST sees one coherent
-                            # completion session across all chunks.
-                            chunk["id"] = chat_id
-                            chunk["model"] = settings.virtual_model_name
-                            # ensure_ascii=False keeps non-ASCII text (e.g.
-                            # Chinese RP prose) as compact raw UTF-8 instead
-                            # of bloated \uXXXX escape sequences.
-                            rendered = f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                            if decided:
-                                yield rendered
-                            else:
-                                buffered.append(rendered)
-                                buffer_text += piece
-                                if len(buffer_text) >= settings.refusal_check_chars:
-                                    decided = True
-                                    if looks_like_refusal(buffer_text):
-                                        logger.warning(
-                                            "Stage 2 output looks like a refusal; "
-                                            "falling back to raw stage-1 text"
-                                        )
-                                        async for evt in _stream_raw_as_chunks(raw_text, chat_id):
-                                            yield evt
-                                        return
-                                    for b in buffered:
-                                        yield b
-                                    buffered.clear()
                         except json.JSONDecodeError:
                             yield line + "\n\n"
-                    else:
-                        if line == "data: [DONE]" and not decided:
-                            # Defer the terminator until the refusal decision
-                            # and buffer flush have happened.
-                            upstream_done = True
                             continue
-                        # Covers ":" comment lines.
+
+                        choices = chunk.get("choices") or []
+                        if chunk.get("usage"):
+                            s2_usage = chunk["usage"]
+                        # Usage-only chunks carry bookkeeping WE asked for;
+                        # ST never requested it, so it is consumed here and
+                        # never forwarded downstream.
+                        if not choices:
+                            continue
+
+                        # One chunk ~= one token; llama.cpp-style progress.
+                        piece = (choices[0].get("delta") or {}).get("content") or ""
+                        if piece:
+                            if s2_first is None:
+                                s2_first = time.monotonic()
+                                logger.info("Stage 2: TTFT %.2fs", s2_first - s2_start)
+                            s2_n += 1
+                            if s2_n % 100 == 0:
+                                tg = s2_n / max(time.monotonic() - s2_first, 1e-6)
+                                logger.info("Stage 2: n_gen=%d, tg=%.1f t/s", s2_n, tg)
+
+                        # Consistent id/model so ST sees one coherent
+                        # completion session across all chunks.
+                        chunk["id"] = chat_id
+                        chunk["model"] = settings.virtual_model_name
+                        # ensure_ascii=False keeps non-ASCII text (e.g.
+                        # Chinese RP prose) as compact raw UTF-8 instead
+                        # of bloated \uXXXX escape sequences.
+                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                    else:
+                        # Covers "data: [DONE]" and any ":" comment lines.
                         yield line + "\n\n"
-
-                # Short output that never reached the check threshold:
-                # decide now, then flush the buffer or fall back.
-                if not decided:
-                    if buffered and looks_like_refusal(buffer_text):
-                        logger.warning(
-                            "Stage 2 output looks like a refusal; falling back to raw stage-1 text"
-                        )
-                        async for evt in _stream_raw_as_chunks(raw_text, chat_id):
-                            yield evt
-                        return
-                    for b in buffered:
-                        yield b
-                    buffered.clear()
-                if upstream_done:
-                    yield "data: [DONE]\n\n"
-
-                if s2_n:
-                    elapsed = time.monotonic() - (s2_first or s2_start)
-                    suffix = " (client disconnected, partial)" if disconnected else ""
-                    logger.info(
-                        "Stage 2 done: ~%d tokens in %.1fs (%.1f t/s avg)%s",
-                        s2_n, elapsed, s2_n / max(elapsed, 1e-6), suffix,
-                    )
     except httpx.HTTPError as exc:
         logger.error("Stage 2 connection error: %s", exc)
         yield _sse_error(f"Stage 2 connection failed: {exc}")
+    finally:
+        # Record stage-2 timing even on partial/disconnected streams so the
+        # end-of-request summary stays complete.
+        s2_total = time.monotonic() - s2_start
+        stats["stage2"] = {
+            "total_s": s2_total,
+            "ttft_s": (s2_first - s2_start) if s2_first else None,
+            "gen_s": (time.monotonic() - s2_first) if s2_first else None,
+            "completion_tokens": (s2_usage or {}).get("completion_tokens") or (s2_n or None),
+            "partial": disconnected,
+        }
+
+
+async def stream_stage2(
+    request: ChatCompletionRequest,
+    raw_request: Request,
+) -> AsyncGenerator[str, None]:
+    """
+    Thin wrapper around the streaming pipeline that guarantees the
+    per-request timing summary is logged exactly once, however the request
+    ends (complete, error, or client disconnect).
+    """
+    stats: dict = {}
+    try:
+        async for event in _stream_stage2_impl(request, raw_request, stats):
+            yield event
+    finally:
+        log_request_summary(stats)
+
+
+def _fmt_stage(s: dict) -> str:
+    """Format one stage's timing: total Xs | prefill Ys (N tok, S t/s) | gen Zs (N tok, S t/s)."""
+    parts = [f"total {s['total_s']:.1f}s"]
+    if s.get("ttft_s") is not None:
+        seg = f"prefill {s['ttft_s']:.1f}s"
+        pt = s.get("prompt_tokens")
+        if pt and s["ttft_s"] > 0:
+            seg += f" ({pt} tok, {pt / s['ttft_s']:.1f} t/s)"
+        parts.append(seg)
+    if s.get("gen_s") is not None:
+        seg = f"gen {s['gen_s']:.1f}s"
+        ct = s.get("completion_tokens")
+        if ct and s["gen_s"] > 0:
+            seg += f" ({ct} tok, {ct / s['gen_s']:.1f} t/s)"
+        parts.append(seg)
+    elif s.get("completion_tokens"):
+        parts.append(f"completion {s['completion_tokens']} tok")
+    return " | ".join(parts)
+
+
+def log_request_summary(stats: dict) -> None:
+    """
+    llama.cpp-style per-request timing breakdown: how long each stage spent
+    on prefill vs generation and at what speed, plus the end-to-end total.
+    """
+    s1 = stats.get("stage1")
+    s2 = stats.get("stage2")
+    if not s1 and not s2:
+        return
+    logger.info("---- request timing ----")
+    if s1:
+        split = ""
+        if s1.get("reasoning_n"):
+            split = f" [reasoning {s1['reasoning_n']} + story {s1['story_n']}]"
+        logger.info("Stage 1 (content): %s%s", _fmt_stage(s1), split)
+    if s2:
+        partial = " (partial)" if s2.get("partial") else ""
+        logger.info("Stage 2 (style):   %s%s", _fmt_stage(s2), partial)
+    total = sum(s.get("total_s", 0.0) for s in (s1, s2) if s)
+    logger.info("Total: %.1fs", total)
 
 
 def _sse_error(message: str) -> str:
