@@ -1,7 +1,8 @@
 """Configuration via .env — URLs, model names, optional stage-2 overrides.
 
-Only connection/behaviour knobs live here. There are deliberately NO prompt
-settings: this proxy is a transparent relay and never injects text.
+Connection/behaviour knobs live here, plus the optional inline stage-2
+prompt (STAGE2_PROMPT). When set, it takes priority over the prompt file;
+leave it unset and the file path below keeps working unchanged.
 """
 
 from typing import Optional
@@ -67,6 +68,14 @@ class Settings(BaseSettings):
     # the file is re-read on every request. Relative paths resolve against
     # the project directory. Set empty to run stage 2 without a system prompt.
     stage2_prompt_file: Optional[str] = "stage2_prompt.txt"
+    # Inline prompt content, straight from .env. When non-empty it is used
+    # AS-IS as the stage-2 system prompt and the file above is ignored;
+    # unset/empty keeps the file as the source. Multi-line values in .env
+    # need quotes (KEY="""line one
+    # line two"""). Unlike the file — re-read per request — .env is read
+    # once at startup, so changing this value needs a restart.
+    # The {STYLE_BLOCKS} placeholder works here too.
+    stage2_prompt: Optional[str] = None
     # Comma-separated tag names whose <tag>...</tag> blocks get extracted
     # from the incoming ST messages and forwarded into the stage-2 system
     # prompt (via the {STYLE_BLOCKS} placeholder in stage2_prompt.txt).

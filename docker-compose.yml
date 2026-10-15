@@ -37,6 +37,8 @@ services:
       # host go live without rebuild; falls back to the baked-in copy if the
       # mount is absent (loader handles that gracefully).
       STAGE2_PROMPT_FILE: ${STAGE2_PROMPT_FILE:-/app/prompt/stage2_prompt.txt}
+      # Inline prompt content from .env; when set it wins over the file above.
+      STAGE2_PROMPT: ${STAGE2_PROMPT:-}
       STAGE2_STYLE_TAGS: ${STAGE2_STYLE_TAGS:-}
       # --- SSE keepalive interval during stage 1 (seconds) ---
       KEEPALIVE_INTERVAL: ${KEEPALIVE_INTERVAL:-5}

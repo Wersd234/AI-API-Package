@@ -11,7 +11,7 @@ SillyTavern ──→ 本代理 (:5000) ──→ Stage 1 设备A (内容生成,
 
 **Stage 1 零注入**：收到 ST 的原样请求（含角色卡），所有采样参数原样透传。
 
-**Stage 2 带润色提示词**：系统提示词在 `stage2_prompt.txt`（每次请求实时读取，改完不用重启）。它约束模型：只润色正文、删除思考碎片和元评论、`<UpdateVariable>`/`<scene>`/`<details>`/`<StatusPlaceHolderImpl/>` 等功能块逐字节原样保留。
+**Stage 2 带润色提示词**：系统提示词在 `stage2_prompt.txt`（每次请求实时读取，改完不用重启）；也可以在 `.env` 里用 `STAGE2_PROMPT` 直接写提示词内容（多行用三引号，改了要重启，设置后优先于文件）。它约束模型：只润色正文、删除思考碎片和元评论、`<UpdateVariable>`/`<scene>`/`<details>`/`<StatusPlaceHolderImpl/>` 等功能块逐字节原样保留。
 
 **Stage 1 思考块清理**：如果 Stage 1 模型把思维链漏进 content（没用 --reasoning-format 时会这样），代理会先用正则剥掉 `<think>`/`<｜begin▁of▁thinking｜>` 等标签块再送给 Stage 2（`STAGE1_STRIP_REASONING=true`，默认开）。元评论类无标签垃圾由提示词约束 Gemma 删除。
 
@@ -31,7 +31,7 @@ docker compose up -d --build
 ```
 
 - 后端在局域网其他机器上即可，容器默认桥接网络可以访问 LAN IP
-- `stage2_prompt.txt` 以只读卷挂载进容器，**改提示词立即生效**，不用重建不用重启
+- `stage2_prompt.txt` 以只读卷挂载进容器，**改提示词立即生效**，不用重建不用重启（用 `.env` 的 `STAGE2_PROMPT` 内联内容则改了需要重启）
 - 日志：`docker logs -f ai-rp-proxy`（两阶段进度、tok/s、耗时都在里面）
 
 ## 裸机部署
