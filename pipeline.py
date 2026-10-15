@@ -128,12 +128,7 @@ def load_stage2_prompt() -> str:
     Why re-read instead of caching: this prompt is the single most-tuned knob
     in the pipeline. Reading a few KB per request is effectively free, and it
     means edits to stage2_prompt.txt take effect immediately with no restart.
-    (An inline STAGE2_PROMPT from .env is read once at startup — that one
-    needs a restart, like every other .env setting.)
     """
-    if settings.stage2_prompt and settings.stage2_prompt.strip():
-        # Inline content from .env wins over the file when present.
-        return settings.stage2_prompt.strip()
     if not settings.stage2_prompt_file:
         return ""
     configured = Path(settings.stage2_prompt_file)
