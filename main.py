@@ -20,6 +20,7 @@ from config import settings
 from pipeline import (
     build_stage2_payload,
     call_nonstreaming,
+    load_stage2_prompt,
     log_request_summary,
     run_stage1,
     stream_stage2,
@@ -50,6 +51,15 @@ async def lifespan(app: FastAPI):
     includes /v1) always 404s. /v1/models is part of the OpenAI-compatible
     surface we actually depend on, making it the reliable liveness check.
     """
+    # Print the stage-2 prompt that is actually live right now, read through
+    # the same loader requests use — a glance at the startup log shows what
+    # the polish pass will really send.
+    prompt = load_stage2_prompt()
+    logger.info(
+        "Stage 2 prompt source: %s (%d chars)\n%s",
+        settings.stage2_prompt_file or "none", len(prompt),
+        prompt if prompt else "(no system prompt)",
+    )
     async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
         for name, url in [
             ("Stage 1", settings.stage1_url),
