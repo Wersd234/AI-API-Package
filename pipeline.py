@@ -31,6 +31,49 @@ from schemas import ChatCompletionRequest
 logger = logging.getLogger("uvicorn.error")
 
 # ---------------------------------------------------------------------------
+# Backend API Key configuration & automatic httpx header injection
+# ---------------------------------------------------------------------------
+# Reads stage1_api_key / stage2_api_key from settings if present; defaults
+# Stage 1 (Strata) to "123". Because main.py imports pipeline.py at module
+# load time, patching httpx.AsyncClient here also covers main.py's untouched
+# lifespan() /models startup probe automatically.
+STAGE1_API_KEY: str = getattr(settings, "stage1_api_key", None) or "123"
+STAGE2_API_KEY: str = getattr(settings, "stage2_api_key", None) or ""
+
+
+def _backend_headers(base_url: str) -> Dict[str, str]:
+    """Return Authorization Bearer header matching the target backend URL."""
+    u = base_url.rstrip("/")
+    if STAGE1_API_KEY and u.startswith(settings.stage1_url.rstrip("/")):
+        return {"Authorization": f"Bearer {STAGE1_API_KEY}"}
+    if STAGE2_API_KEY and u.startswith(settings.stage2_url.rstrip("/")):
+        return {"Authorization": f"Bearer {STAGE2_API_KEY}"}
+    return {}
+
+
+async def _inject_backend_auth(req: httpx.Request) -> None:
+    headers = _backend_headers(str(req.url))
+    for k, v in headers.items():
+        req.headers.setdefault(k, v)
+
+
+_orig_async_client_init = httpx.AsyncClient.__init__
+
+
+def _patched_async_client_init(self, *args, **kwargs):
+    hooks = dict(kwargs.get("event_hooks") or {})
+    req_hooks = list(hooks.get("request") or [])
+    if _inject_backend_auth not in req_hooks:
+        req_hooks.append(_inject_backend_auth)
+    hooks["request"] = req_hooks
+    kwargs["event_hooks"] = hooks
+    _orig_async_client_init(self, *args, **kwargs)
+
+
+httpx.AsyncClient.__init__ = _patched_async_client_init
+
+
+# ---------------------------------------------------------------------------
 # Leaked chain-of-thought cleanup (stage-1 output hygiene)
 # ---------------------------------------------------------------------------
 # Content models sometimes leak their reasoning into `content` instead of the
@@ -38,6 +81,7 @@ logger = logging.getLogger("uvicorn.error")
 # on the server). These patterns cover the formats observed in the wild.
 _REASONING_PATTERNS = [
     re.compile(r"<think>.*?</think>", re.DOTALL),
+    re.compile(r"<\|thought\|>.*?</\|thought\|>", re.DOTALL),
     re.compile(r"<｜begin▁of▁thinking｜>.*?<｜end▁of▁thinking｜>", re.DOTALL),
     # Malformed variant actually observed: the block gets "closed" by a second
     # OPENING tag instead of a closing one.
@@ -46,6 +90,8 @@ _REASONING_PATTERNS = [
 # Orphaned tags left over after the paired patterns above have run.
 _ORPHAN_REASONING_TAGS = [
     "</think>",
+    "</|thought|>",
+    "<|thought|>",
     "</｜begin▁of▁thinking｜>",
     "<｜end▁of▁thinking｜>",
     "<｜begin▁of▁thinking｜>",
@@ -152,6 +198,7 @@ def load_stage2_prompt() -> str:
         logger.warning("Stage 2 running WITHOUT a system prompt")
         return ""
 
+
 # Fields never copied from the ST request into the stage-2 payload:
 # messages/model/stream must differ by design; the token cap gets its own
 # floor logic; n is forced to 1 because this is a single-candidate pipeline.
@@ -190,8 +237,9 @@ async def call_nonstreaming(
     swallowed into a bare "HTTP error".
     """
     url = f"{base_url}/chat/completions"
+    headers = _backend_headers(base_url)
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout)) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout), headers=headers) as client:
             resp = await client.post(url, json=payload)
     except httpx.HTTPError as exc:
         raise HTTPException(502, f"Backend unreachable ({base_url}): {exc}") from exc
@@ -254,6 +302,7 @@ async def run_stage1(
     payload["stream_options"] = {"include_usage": True}
 
     url = f"{settings.stage1_url}/chat/completions"
+    headers = _backend_headers(settings.stage1_url)
     logger.info("Stage 1: %d messages -> %s", len(payload["messages"]), url)
 
     content_parts: list = []
@@ -268,7 +317,8 @@ async def run_stage1(
 
     try:
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(settings.stage1_timeout, connect=10.0)
+            timeout=httpx.Timeout(settings.stage1_timeout, connect=10.0),
+            headers=headers,
         ) as client:
             async with client.stream("POST", url, json=payload) as resp:
                 if resp.status_code >= 400:
@@ -496,6 +546,7 @@ async def _stream_stage2_impl(
 
     payload = build_stage2_payload(request, raw_text, stream=True)
     url = f"{settings.stage2_url}/chat/completions"
+    headers = _backend_headers(settings.stage2_url)
     logger.info("Stage 2: streaming from %s (%d chars in)", settings.stage2_url, len(raw_text))
 
     # llama.cpp-style progress accounting for the forwarded stream
@@ -507,7 +558,8 @@ async def _stream_stage2_impl(
 
     try:
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(settings.stage2_timeout, connect=10.0)
+            timeout=httpx.Timeout(settings.stage2_timeout, connect=10.0),
+            headers=headers,
         ) as client:
             async with client.stream("POST", url, json=payload) as resp:
                 if resp.status_code >= 400:
@@ -635,7 +687,7 @@ async def stream_stage2(
     per-request timing summary is logged exactly once, however the request
     ends (complete, error, or client disconnect).
     """
-    stats: dict = {}
+    stats: dict = {"request_start": time.monotonic()}
     try:
         async for event in _stream_stage2_impl(request, raw_request, stats):
             yield event
